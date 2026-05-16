@@ -1099,8 +1099,13 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
 
     uint8_t prev_enc_nt[] = {0, 0, 0, 0};
     uint8_t prev_counter = 0;
+    uint32_t total_attempts = 0;
+    uint32_t select_failures = 0;
+    uint32_t auth1_failures = 0;
+    uint32_t auth2_failures = 0;
 
     for (uint16_t i = 0; i <= PM3_CMD_DATA_SIZE - 9;) {
+        total_attempts++;
 
         // Test if the action was cancelled
         if (BUTTON_PRESS()) {
@@ -1112,7 +1117,12 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
         if (have_uid == false) { // need a full select cycle to get the uid first
             iso14a_card_select_t card_info;
             if (iso14443a_select_card(uid, &card_info, &cuid, true, 0, true) == 0) {
-                if (g_dbglevel >= DBG_ERROR) Dbprintf("AcquireEncryptedNonces: Can't select card (ALL)");
+                // Hardnested/staticnested expect many failed selects against
+                // hardened-PRNG tags (Plus EV1, EV2). Gated at DBG_DEBUG so
+                // the default DBG_INFO operator workflow doesn't see tens of
+                // thousands of per-attempt error lines flooding the log.
+                select_failures++;
+                if (g_dbglevel >= DBG_DEBUG) Dbprintf("AcquireEncryptedNonces: Can't select card (ALL)");
                 continue;
             }
             switch (card_info.uidlen) {
@@ -1131,7 +1141,8 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
             have_uid = true;
         } else { // no need for anticollision. We can directly select the card
             if (iso14443a_fast_select_card(uid, cascade_levels) == 0) {
-                if (g_dbglevel >= DBG_ERROR) Dbprintf("AcquireEncryptedNonces: Can't select card (UID)");
+                select_failures++;
+                if (g_dbglevel >= DBG_DEBUG) Dbprintf("AcquireEncryptedNonces: Can't select card (UID)");
                 continue;
             }
         }
@@ -1141,7 +1152,8 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
 
         uint32_t nt1 = 0;
         if (mifare_classic_authex(pcs, cuid, blockNo, keyType, ui64Key, AUTH_FIRST, &nt1, NULL)) {
-            if (g_dbglevel >= DBG_ERROR) Dbprintf("AcquireEncryptedNonces: Auth1 error");
+            auth1_failures++;
+            if (g_dbglevel >= DBG_DEBUG) Dbprintf("AcquireEncryptedNonces: Auth1 error");
             continue;
         }
 
@@ -1152,7 +1164,11 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
         CHK_TIMEOUT();
 
         if (len != 4) {
-            if (g_dbglevel >= DBG_ERROR) Dbprintf("AcquireEncryptedNonces: Auth2 error len=%d", len);
+            // Expected outcome during hardnested against hardened-PRNG tags;
+            // gated at DBG_DEBUG to avoid 30k+ line floods at the default
+            // DBG_INFO level.
+            auth2_failures++;
+            if (g_dbglevel >= DBG_DEBUG) Dbprintf("AcquireEncryptedNonces: Auth2 error len=%d", len);
             continue;
         }
 
@@ -1191,6 +1207,17 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
 
     LED_C_OFF();
     crypto1_deinit(pcs);
+
+    // Aggregate summary so operators see one useful line per command
+    // instead of tens of thousands of per-attempt errors. Most attempts
+    // are expected to fail against hardened-PRNG tags; what matters is
+    // whether we collected enough nonces.
+    if (g_dbglevel >= DBG_INFO && total_attempts > 0) {
+        Dbprintf("AcquireEncryptedNonces: %u attempts, %u nonces, %u sel-fail, %u auth1-fail, %u auth2-fail",
+                 total_attempts, num_nonces, select_failures,
+                 auth1_failures, auth2_failures);
+    }
+
     LED_B_ON();
     reply_old(CMD_ACK, isOK, cuid, num_nonces, buf, sizeof(buf));
     LED_B_OFF();
