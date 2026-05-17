@@ -1099,10 +1099,22 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
 
     uint8_t prev_enc_nt[] = {0, 0, 0, 0};
     uint8_t prev_counter = 0;
+    // Aggregate counters for the DBG_INFO summary that replaces the
+    // per-attempt DBG_ERROR spam silenced by the gate above.
     uint32_t total_attempts = 0;
     uint32_t select_failures = 0;
     uint32_t auth1_failures = 0;
     uint32_t auth2_failures = 0;
+    // AUTHLIM detector: real Plus EV1 / EV2 (and other hardened-PRNG
+    // tags) implement an AUTHLIM counter that locks the card after N
+    // failed auths. Once locked, the card stops responding to anti-coll
+    // until it's removed from the RF field. PM3 used to keep hammering
+    // the dead card forever. We now bail after this many consecutive
+    // select failures with no successful nonce yet, and emit a periodic
+    // heartbeat so the client doesn't time out before the bail fires.
+    uint32_t consecutive_select_failures = 0;
+    const uint32_t LOCKOUT_BAIL_THRESHOLD = 100;
+    const uint32_t LOCKOUT_HEARTBEAT_EVERY = 25;
 
     for (uint16_t i = 0; i <= PM3_CMD_DATA_SIZE - 9;) {
         total_attempts++;
@@ -1117,14 +1129,32 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
         if (have_uid == false) { // need a full select cycle to get the uid first
             iso14a_card_select_t card_info;
             if (iso14443a_select_card(uid, &card_info, &cuid, true, 0, true) == 0) {
-                // Hardnested/staticnested expect many failed selects against
-                // hardened-PRNG tags (Plus EV1, EV2). Gated at DBG_DEBUG so
-                // the default DBG_INFO operator workflow doesn't see tens of
-                // thousands of per-attempt error lines flooding the log.
+                // Gated at DBG_DEBUG so default DBG_INFO operator workflow
+                // doesn't see tens of thousands of per-attempt error lines
+                // during hardnested against hardened-PRNG tags.
                 select_failures++;
                 if (g_dbglevel >= DBG_DEBUG) Dbprintf("AcquireEncryptedNonces: Can't select card (ALL)");
+                consecutive_select_failures++;
+                if (g_dbglevel >= DBG_INFO
+                        && consecutive_select_failures > 0
+                        && (consecutive_select_failures % LOCKOUT_HEARTBEAT_EVERY) == 0) {
+                    Dbprintf("AcquireEncryptedNonces: %u consecutive select failures, retrying...",
+                             consecutive_select_failures);
+                }
+                if (consecutive_select_failures >= LOCKOUT_BAIL_THRESHOLD) {
+                    if (g_dbglevel >= DBG_INFO) {
+                        Dbprintf("AcquireEncryptedNonces: card unresponsive after %u "
+                                 "consecutive select failures.", consecutive_select_failures);
+                        DbpString("Card may be in AUTHLIM lockout (Plus EV1 / EV2). "
+                                  "Lift card off the RF field for 3s and retry.");
+                    }
+                    isOK = PM3_ETIMEOUT;
+                    field_off = true;
+                    break;
+                }
                 continue;
             }
+            consecutive_select_failures = 0;
             switch (card_info.uidlen) {
                 case 4 :
                     cascade_levels = 1;
@@ -1143,8 +1173,27 @@ void MifareAcquireEncryptedNonces(uint32_t arg0, uint32_t arg1, uint32_t flags, 
             if (iso14443a_fast_select_card(uid, cascade_levels) == 0) {
                 select_failures++;
                 if (g_dbglevel >= DBG_DEBUG) Dbprintf("AcquireEncryptedNonces: Can't select card (UID)");
+                consecutive_select_failures++;
+                if (g_dbglevel >= DBG_INFO
+                        && consecutive_select_failures > 0
+                        && (consecutive_select_failures % LOCKOUT_HEARTBEAT_EVERY) == 0) {
+                    Dbprintf("AcquireEncryptedNonces: %u consecutive select failures, retrying...",
+                             consecutive_select_failures);
+                }
+                if (consecutive_select_failures >= LOCKOUT_BAIL_THRESHOLD) {
+                    if (g_dbglevel >= DBG_INFO) {
+                        Dbprintf("AcquireEncryptedNonces: card unresponsive after %u "
+                                 "consecutive select failures.", consecutive_select_failures);
+                        DbpString("Card may be in AUTHLIM lockout (Plus EV1 / EV2). "
+                                  "Lift card off the RF field for 3s and retry.");
+                    }
+                    isOK = PM3_ETIMEOUT;
+                    field_off = true;
+                    break;
+                }
                 continue;
             }
+            consecutive_select_failures = 0;
         }
 
         if (slow)
